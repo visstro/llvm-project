@@ -140,6 +140,7 @@ readability/*
 | {doc}`bugprone-posix-return <bugprone/posix-return>` | Yes |
 | {doc}`bugprone-random-generator-seed <bugprone/random-generator-seed>` |  |
 | {doc}`bugprone-raw-memory-call-on-non-trivial-type <bugprone/raw-memory-call-on-non-trivial-type>` |  |
+| {doc}`bugprone-raw-owning-pointer-member <bugprone/raw-owning-pointer-member>` |  |
 | {doc}`bugprone-redundant-branch-condition <bugprone/redundant-branch-condition>` | Yes |
 | {doc}`bugprone-reserved-identifier <bugprone/reserved-identifier>` | Yes |
 | {doc}`bugprone-return-const-ref-from-parameter <bugprone/return-const-ref-from-parameter>` |  |
