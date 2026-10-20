@@ -9,9 +9,11 @@
 #include "RawOwningPointerMemberCheck.h"
 #include "../utils/OptionsUtils.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/StmtCXX.h"
 #include "clang/ASTMatchers/ASTMatchFinder.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include <optional>
@@ -135,23 +137,80 @@ private:
       collectGuards(Child, Out);
   }
 
-  void visitDelete(const CXXDeleteExpr *Delete) {
-    const Expr *Arg = Delete->getArgument()->IgnoreParenImpCasts();
-    if (const FieldDecl *FD = getThisPointerMember(Arg, RD)) {
-      record(FD, Delete, /*Direct=*/true);
+  /// Records the release of \p E at \p Site if \p E names a member, a local
+  /// alias of a member, or an element of a member array or container.
+  void recordRelease(const Expr *E, const Stmt *Site) {
+    E = E->IgnoreParenImpCasts();
+    if (const FieldDecl *FD = getThisPointerMember(E, RD)) {
+      record(FD, Site, /*Direct=*/true);
       return;
     }
-    // 'delete Array[I]' where 'Array' is a member array of pointers.
-    if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(Arg)) {
+    // 'Array[I]' or 'Container[I]'.
+    if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {
       if (const FieldDecl *FD = getThisMember(ASE->getBase(), RD);
-          FD && FD->getType()->isArrayType())
-        record(FD, Delete, /*Direct=*/false);
+          FD &&
+          (FD->getType()->isArrayType() || FD->getType()->isPointerType()))
+        record(FD, Site, /*Direct=*/false);
       return;
     }
-    // 'for (T *E : Container) delete E;'
-    for (const auto &[LoopVar, Container] : LoopVars)
-      if (refersTo(Arg, LoopVar))
-        record(Container, Delete, /*Direct=*/false);
+    if (const auto *OpCall = dyn_cast<CXXOperatorCallExpr>(E);
+        OpCall && OpCall->getOperator() == OO_Subscript) {
+      if (const FieldDecl *FD = getThisMember(OpCall->getArg(0), RD))
+        record(FD, Site, /*Direct=*/false);
+      return;
+    }
+    // A local variable, possibly through one member access and one
+    // dereference: 'Alias', 'Elem', 'Elem.second', '*It', 'It->second'.
+    bool Stripped = false;
+    if (const auto *ME = dyn_cast<MemberExpr>(E);
+        ME && isa<FieldDecl>(ME->getMemberDecl())) {
+      E = ME->getBase()->IgnoreParenImpCasts();
+      Stripped = true;
+    }
+    if (const auto *UO = dyn_cast<UnaryOperator>(E);
+        UO && UO->getOpcode() == UO_Deref) {
+      E = UO->getSubExpr()->IgnoreParenImpCasts();
+      Stripped = true;
+    } else if (const auto *OpCall = dyn_cast<CXXOperatorCallExpr>(E);
+               OpCall && (OpCall->getOperator() == OO_Star ||
+                          OpCall->getOperator() == OO_Arrow)) {
+      E = OpCall->getArg(0)->IgnoreParenImpCasts();
+      Stripped = true;
+    }
+    const auto *DRE = dyn_cast<DeclRefExpr>(E);
+    if (!DRE)
+      return;
+    const auto It = Locals.find(DRE->getDecl());
+    if (It == Locals.end())
+      return;
+    const auto [FD, IsAlias] = It->second;
+    // 'delete Alias->Next' does not release the member itself.
+    if (IsAlias && Stripped)
+      return;
+    record(FD, Site, /*Direct=*/IsAlias);
+  }
+
+  /// Remembers a local variable that is an alias of a pointer member, or an
+  /// iterator into a member container.
+  void visitLocal(const VarDecl *VD) {
+    const Expr *Init = VD->getInit();
+    if (!Init)
+      return;
+    Init = Init->IgnoreUnlessSpelledInSource();
+    if (const FieldDecl *FD = getThisPointerMember(Init, RD)) {
+      Locals.try_emplace(VD, FD, /*IsAlias=*/true);
+      return;
+    }
+    // 'auto It = Container.begin()'
+    if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(Init)) {
+      const CXXMethodDecl *Method = MCE->getMethodDecl();
+      if (Method && Method->getDeclName().isIdentifier() &&
+          llvm::is_contained({"begin", "cbegin", "rbegin", "crbegin"},
+                             Method->getName()))
+        if (const FieldDecl *FD =
+                getThisMember(MCE->getImplicitObjectArgument(), RD))
+          Locals.try_emplace(VD, FD, /*IsAlias=*/false);
+    }
   }
 
   void visit(const Stmt *S, unsigned Depth) {
@@ -159,7 +218,11 @@ private:
       return;
 
     if (const auto *Delete = dyn_cast<CXXDeleteExpr>(S)) {
-      visitDelete(Delete);
+      recordRelease(Delete->getArgument(), Delete);
+    } else if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+      for (const Decl *D : DS->decls())
+        if (const auto *VD = dyn_cast<VarDecl>(D))
+          visitLocal(VD);
     } else if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(S)) {
       const CXXMethodDecl *Method = MCE->getMethodDecl();
       const Expr *Object = MCE->getImplicitObjectArgument();
@@ -180,8 +243,7 @@ private:
     } else if (const auto *Call = dyn_cast<CallExpr>(S)) {
       if (const FunctionDecl *Callee = Call->getDirectCallee();
           Callee && Call->getNumArgs() > 0 && matchesName(Callee, Deallocators))
-        if (const FieldDecl *FD = getThisPointerMember(Call->getArg(0), RD))
-          record(FD, Call, /*Direct=*/true);
+        recordRelease(Call->getArg(0), Call);
     } else if (const auto *If = dyn_cast<IfStmt>(S)) {
       const size_t OldSize = Guards.size();
       collectGuards(If->getCond(), Guards);
@@ -190,12 +252,9 @@ private:
       Guards.resize(OldSize);
       return;
     } else if (const auto *ForRange = dyn_cast<CXXForRangeStmt>(S)) {
-      if (const FieldDecl *FD = getThisMember(ForRange->getRangeInit(), RD)) {
-        LoopVars.emplace_back(ForRange->getLoopVariable(), FD);
-        visit(ForRange->getBody(), Depth);
-        LoopVars.pop_back();
-        return;
-      }
+      // 'for (T *E : Container) delete E;'
+      if (const FieldDecl *FD = getThisMember(ForRange->getRangeInit(), RD))
+        Locals.try_emplace(ForRange->getLoopVariable(), FD, /*IsAlias=*/false);
     }
 
     for (const Stmt *Child : S->children())
@@ -206,7 +265,9 @@ private:
   ArrayRef<StringRef> Deallocators;
   ReleaseMap Releases;
   SmallVector<const FieldDecl *, 4> Guards;
-  SmallVector<std::pair<const VarDecl *, const FieldDecl *>, 2> LoopVars;
+  /// Local variables that refer to a member, with whether they are an alias of
+  /// the member itself rather than an element or iterator of it.
+  llvm::DenseMap<const ValueDecl *, std::pair<const FieldDecl *, bool>> Locals;
 };
 
 /// Facts about the body of a user-written copy or move operation.
@@ -347,38 +408,127 @@ static const FieldDecl *findShallowCopy(const OperationFacts &Facts,
   return nullptr;
 }
 
-/// Returns whether the implicitly declared copy constructor of \p RD is
-/// deleted, or std::nullopt if that is not known without Sema.
+static std::optional<bool> isImplicitCopyDeleted(const CXXRecordDecl *RD,
+                                                 bool Assign,
+                                                 const ASTContext &Ctx);
+
+/// Returns whether \p RD has no accessible, non-deleted copy constructor (or
+/// copy assignment operator if \p Assign is true), or std::nullopt if that is
+/// not known.
 static std::optional<bool>
-isImplicitCopyConstructorDeleted(const CXXRecordDecl *RD) {
-  if (RD->hasUserDeclaredMoveConstructor() ||
-      RD->hasUserDeclaredMoveAssignment())
-    return true;
-  if (!RD->needsImplicitCopyConstructor()) {
-    for (const CXXConstructorDecl *Ctor : RD->ctors())
-      if (Ctor->isImplicit() && Ctor->isCopyConstructor())
-        return Ctor->isDeleted();
+isCopyUnavailable(const CXXRecordDecl *RD, bool Assign, const ASTContext &Ctx) {
+  RD = RD->getDefinition();
+  if (!RD)
     return std::nullopt;
+  const bool UserDeclared = Assign ? RD->hasUserDeclaredCopyAssignment()
+                                   : RD->hasUserDeclaredCopyConstructor();
+  if (!UserDeclared)
+    return isImplicitCopyDeleted(RD, Assign, Ctx);
+  bool Available = false;
+  for (const CXXMethodDecl *Method : RD->methods()) {
+    const auto *Ctor = dyn_cast<CXXConstructorDecl>(Method);
+    const bool IsCopy = Assign ? Method->isCopyAssignmentOperator()
+                               : Ctor && Ctor->isCopyConstructor();
+    if (IsCopy && !Method->isImplicit() && !Method->isDeleted() &&
+        Method->getAccess() != AS_private)
+      Available = true;
   }
-  if (RD->needsOverloadResolutionForCopyConstructor())
-    return std::nullopt;
-  return RD->defaultedCopyConstructorIsDeleted();
+  return !Available;
 }
 
+/// Decides from the bases and members whether the implicit copy operation of
+/// a class template pattern is deleted. Sema does not declare implicit members
+/// for templates, so the bits on 'CXXRecordDecl' are not always computed.
 static std::optional<bool>
-isImplicitCopyAssignmentDeleted(const CXXRecordDecl *RD) {
+isImplicitCopyDeletedInPattern(const CXXRecordDecl *RD, bool Assign,
+                               const ASTContext &Ctx) {
+  for (const CXXBaseSpecifier &Base : RD->bases()) {
+    if (Base.getType()->isDependentType())
+      return std::nullopt;
+    const CXXRecordDecl *BaseRD = Base.getType()->getAsCXXRecordDecl();
+    if (!BaseRD)
+      return std::nullopt;
+    const std::optional<bool> Unavailable =
+        isCopyUnavailable(BaseRD, Assign, Ctx);
+    if (!Unavailable || *Unavailable)
+      return Unavailable;
+  }
+  for (const FieldDecl *Field : RD->fields()) {
+    const QualType Type = Ctx.getBaseElementType(Field->getType());
+    if (Type->isReferenceType()) {
+      if (Assign)
+        return true;
+      continue;
+    }
+    if (Assign && Type.isConstQualified())
+      return true;
+    if (Type->isDependentType()) {
+      if (Type->isPointerType() || Type->isMemberPointerType())
+        continue;
+      return std::nullopt;
+    }
+    if (const CXXRecordDecl *FieldRD = Type->getAsCXXRecordDecl()) {
+      const std::optional<bool> Unavailable =
+          isCopyUnavailable(FieldRD, Assign, Ctx);
+      if (!Unavailable || *Unavailable)
+        return Unavailable;
+    }
+  }
+  return false;
+}
+
+/// Returns whether the implicitly declared copy constructor (or copy
+/// assignment operator if \p Assign is true) of \p RD is deleted, or
+/// std::nullopt if that is not known.
+static std::optional<bool> isImplicitCopyDeleted(const CXXRecordDecl *RD,
+                                                 bool Assign,
+                                                 const ASTContext &Ctx) {
   if (RD->hasUserDeclaredMoveConstructor() ||
       RD->hasUserDeclaredMoveAssignment())
     return true;
-  if (!RD->needsImplicitCopyAssignment()) {
-    for (const CXXMethodDecl *Method : RD->methods())
-      if (Method->isImplicit() && Method->isCopyAssignmentOperator())
+  const bool Declared = Assign ? !RD->needsImplicitCopyAssignment()
+                               : !RD->needsImplicitCopyConstructor();
+  if (Declared) {
+    for (const CXXMethodDecl *Method : RD->methods()) {
+      const auto *Ctor = dyn_cast<CXXConstructorDecl>(Method);
+      const bool IsCopy = Assign ? Method->isCopyAssignmentOperator()
+                                 : Ctor && Ctor->isCopyConstructor();
+      if (IsCopy && Method->isImplicit())
         return Method->isDeleted();
+    }
     return std::nullopt;
   }
-  if (RD->needsOverloadResolutionForCopyAssignment())
+  const bool NeedsOverloadResolution =
+      Assign ? RD->needsOverloadResolutionForCopyAssignment()
+             : RD->needsOverloadResolutionForCopyConstructor();
+  if (!NeedsOverloadResolution)
+    return Assign ? !RD->hasSimpleCopyAssignment()
+                  : RD->defaultedCopyConstructorIsDeleted();
+  if (!RD->isDependentContext())
     return std::nullopt;
-  return !RD->hasSimpleCopyAssignment();
+
+  if (const std::optional<bool> Deleted =
+          isImplicitCopyDeletedInPattern(RD, Assign, Ctx))
+    return Deleted;
+  // Fall back to the instantiations of the template: the copy is not deleted
+  // if it is not deleted in one of them.
+  const ClassTemplateDecl *Template = RD->getDescribedClassTemplate();
+  if (!Template)
+    return std::nullopt;
+  std::optional<bool> Result;
+  for (const ClassTemplateSpecializationDecl *Spec :
+       Template->specializations()) {
+    if (Spec->getSpecializationKind() == TSK_ExplicitSpecialization ||
+        !Spec->hasDefinition())
+      continue;
+    const std::optional<bool> Deleted =
+        isImplicitCopyDeleted(Spec->getDefinition(), Assign, Ctx);
+    if (Deleted == std::optional<bool>(false))
+      return false;
+    if (Deleted)
+      Result = true;
+  }
+  return Result;
 }
 
 /// Returns the first member that is released directly, if any.
@@ -395,13 +545,16 @@ RawOwningPointerMemberCheck::RawOwningPointerMemberCheck(
     : ClangTidyCheck(Name, Context),
       Deallocators(utils::options::parseStringList(
           Options.get("Deallocators", "::free;::std::free"))),
-      WarnOnImplicitCopy(Options.get("WarnOnImplicitCopy", true)) {}
+      WarnOnImplicitCopy(Options.get("WarnOnImplicitCopy", true)),
+      IgnorePolymorphicClasses(Options.get("IgnorePolymorphicClasses", false)) {
+}
 
 void RawOwningPointerMemberCheck::storeOptions(
     ClangTidyOptions::OptionMap &Opts) {
   Options.store(Opts, "Deallocators",
                 utils::options::serializeStringList(Deallocators));
   Options.store(Opts, "WarnOnImplicitCopy", WarnOnImplicitCopy);
+  Options.store(Opts, "IgnorePolymorphicClasses", IgnorePolymorphicClasses);
 }
 
 void RawOwningPointerMemberCheck::registerMatchers(MatchFinder *Finder) {
@@ -435,13 +588,19 @@ void RawOwningPointerMemberCheck::check(
   };
 
   // Implicitly declared copy operations.
-  if (WarnOnImplicitCopy) {
+  const bool MaybePolymorphic =
+      RD->isPolymorphic() ||
+      (RD->isDependentContext() && RD->hasAnyDependentBases());
+  if (WarnOnImplicitCopy && !(IgnorePolymorphicClasses && MaybePolymorphic)) {
+    const ASTContext &Ctx = *Result.Context;
     const bool ImplicitCtor =
         !RD->hasUserDeclaredCopyConstructor() &&
-        isImplicitCopyConstructorDeleted(RD) == std::optional<bool>(false);
+        isImplicitCopyDeleted(RD, /*Assign=*/false, Ctx) ==
+            std::optional<bool>(false);
     const bool ImplicitAssign =
         !RD->hasUserDeclaredCopyAssignment() &&
-        isImplicitCopyAssignmentDeleted(RD) == std::optional<bool>(false);
+        isImplicitCopyDeleted(RD, /*Assign=*/true, Ctx) ==
+            std::optional<bool>(false);
     if (ImplicitCtor || ImplicitAssign) {
       const auto &[FD, R] = Releases.front();
       diag(RD->getLocation(),

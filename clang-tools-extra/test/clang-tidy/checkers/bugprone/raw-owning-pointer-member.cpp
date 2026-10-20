@@ -14,6 +14,25 @@ template <class T> void swap(T &a, T &b) { T tmp = a; a = b; b = tmp; }
 template <class T> struct vector {
   T *begin();
   T *end();
+  T &operator[](size_t);
+  size_t size() const;
+};
+template <class K, class V> struct pair { K first; V second; };
+template <class K, class V> struct map {
+  struct iterator {
+    pair<K, V> &operator*();
+    pair<K, V> *operator->();
+    iterator &operator++();
+    bool operator!=(const iterator &) const;
+  };
+  iterator begin();
+  iterator end();
+};
+struct string {
+  string();
+  string(const string &);
+  string &operator=(const string &);
+  ~string();
 };
 } // namespace std
 
@@ -97,6 +116,66 @@ template <class T> struct TemplateOwner {
   ~TemplateOwner() { delete p; }
 };
 TemplateOwner<int> Instantiated;
+
+template <class T> struct TemplateWithClassMember {
+  // CHECK-MESSAGES: :[[@LINE-1]]:27: warning: 'TemplateWithClassMember' releases pointer member 'p' in its destructor, but its implicitly-declared copy constructor and copy assignment operator copy it shallowly
+  std::string name;
+  T *p;
+  ~TemplateWithClassMember() { delete p; }
+};
+
+template <class T> struct TemplateWithDependentMember {
+  // CHECK-MESSAGES: :[[@LINE-1]]:27: warning: 'TemplateWithDependentMember' releases pointer member 'p' in its destructor
+  T value;
+  T *p;
+  ~TemplateWithDependentMember() { delete p; }
+};
+TemplateWithDependentMember<int> InstantiatedDependent;
+
+template <class T> struct TemplateNeverInstantiated {
+  // CHECK-MESSAGES: :[[@LINE-1]]:27: warning: 'TemplateNeverInstantiated' releases pointer member 'p' in its destructor
+  T value;
+  T *p;
+  ~TemplateNeverInstantiated() { delete p; }
+};
+
+struct IndexLoop {
+  // CHECK-MESSAGES: :[[@LINE-1]]:8: warning: 'IndexLoop' releases pointer member 'v' in its destructor
+  std::vector<int *> v;
+  ~IndexLoop() { for (size_t i = 0; i < v.size(); ++i) delete v[i]; }
+};
+
+struct PointerToPointers {
+  // CHECK-MESSAGES: :[[@LINE-1]]:8: warning: 'PointerToPointers' releases pointer member 'items' in its destructor
+  int **items;
+  int count;
+  ~PointerToPointers() { for (int i = 0; i < count; ++i) delete items[i]; delete[] items; }
+};
+
+struct IteratorLoop {
+  // CHECK-MESSAGES: :[[@LINE-1]]:8: warning: 'IteratorLoop' releases pointer member 'm' in its destructor
+  std::map<int, int *> m;
+  ~IteratorLoop() {
+    for (std::map<int, int *>::iterator it = m.begin(); it != m.end(); ++it)
+      delete it->second;
+  }
+};
+
+struct RangeForPair {
+  // CHECK-MESSAGES: :[[@LINE-1]]:8: warning: 'RangeForPair' releases pointer member 'm' in its destructor
+  std::map<int, int *> m;
+  ~RangeForPair() { for (auto &kv : m) delete kv.second; }
+};
+
+struct Node { Node *next; };
+struct LinkedList {
+  // CHECK-MESSAGES: :[[@LINE-1]]:8: warning: 'LinkedList' releases pointer member 'head' in its destructor
+  Node *head;
+  ~LinkedList() {
+    Node *cur = head;
+    while (cur) { Node *next = cur->next; delete cur; cur = next; }
+  }
+};
 
 // User-written copy operations.
 
@@ -297,6 +376,23 @@ struct ContainerMovedByDefault {
   std::vector<int *> v;
   ContainerMovedByDefault(ContainerMovedByDefault &&) = default;
   ~ContainerMovedByDefault() { for (int *x : v) delete x; }
+};
+
+template <class T> struct TemplateWithDeletedMember {
+  NonCopyable m;
+  T *p;
+  ~TemplateWithDeletedMember() { delete p; }
+};
+
+struct AliasMemberDeleted {
+  Node *head;
+  AliasMemberDeleted(const AliasMemberDeleted &) = delete;
+  AliasMemberDeleted &operator=(const AliasMemberDeleted &) = delete;
+  ~AliasMemberDeleted() { Node *cur = head; delete cur->next; }
+};
+struct AliasNotOwned {
+  Node *head;
+  ~AliasNotOwned() { Node *cur = head; delete cur->next; }
 };
 
 struct UnrelatedDelete {

@@ -10,15 +10,21 @@ which is a double free.
 A member counts as owned if the destructor, or a member function of the same
 class that the destructor calls, releases it with `delete`, `delete[]`, an
 explicit destructor call such as `P->~T()`, or one of the
-{option}`Deallocators`. A member array of pointers, or a container of pointers
-whose elements are deleted in a range-based `for` loop, also counts. Nothing is
-reported if the body of the destructor is not visible.
+{option}`Deallocators`. The release may go through a local variable
+initialized from the member (`Node *Cur = Head; ... delete Cur;`). Releasing the
+elements of a member array, of a pointer to pointers, or of a container also
+counts, whether through an index (`delete V[I]`), an iterator (`delete *It`,
+`delete It->second`) or a range-based `for` loop variable (`delete E`,
+`delete KV.second`). Nothing is reported if the body of the destructor is not
+visible.
 
 The check reports:
 
 - Implicitly-declared copy operations of a class that owns a pointer member.
   Copy operations that are deleted, for example because a base class or a
-  member is not copyable, are not reported.
+  member is not copyable, are not reported. In a class template, the bases and
+  members of the template, and otherwise its instantiations, decide whether
+  the implicit copy operations are deleted.
 
   ```c++
   struct Buffer {   // warning: 'Buffer' releases pointer member 'Data' in its
@@ -93,4 +99,13 @@ Other names match the unqualified or the fully qualified name. Default is
 When `true`, the check reports classes that own a pointer member and whose
 copy constructor or copy assignment operator is implicitly declared. Default is
 `true`.
+```
+
+```{option} IgnorePolymorphicClasses
+When `true`, implicitly-declared copy operations are not reported for
+polymorphic classes, or for class templates with a dependent base class. Such
+classes are often only used through pointers and never copied, although a copy
+through a base class reference still compiles and slices the object.
+User-written and defaulted copy and move operations are still reported.
+Default is `false`.
 ```

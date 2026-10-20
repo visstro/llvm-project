@@ -35,6 +35,7 @@ public:
 private:
   const std::vector<StringRef> Deallocators;
   const bool WarnOnImplicitCopy;
+  const bool IgnorePolymorphicClasses;
 };
 
 } // namespace clang::tidy::bugprone
