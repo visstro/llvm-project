@@ -39,6 +39,7 @@ add_clang_library(clangTidyBugproneModule STATIC
   IncorrectEnableSharedFromThisCheck.cpp
   InvalidEnumDefaultInitializationCheck.cpp
   MissingEndComparisonCheck.cpp
+  RawOwningPointerMemberCheck.cpp
   UnintendedCharOstreamOutputCheck.cpp
   ReturnConstRefFromParameterCheck.cpp
   StdExceptionBaseclassCheck.cpp

@@ -68,6 +68,7 @@
 #include "PosixReturnCheck.h"
 #include "RandomGeneratorSeedCheck.h"
 #include "RawMemoryCallOnNonTrivialTypeCheck.h"
+#include "RawOwningPointerMemberCheck.h"
 #include "RedundantBranchConditionCheck.h"
 #include "ReservedIdentifierCheck.h"
 #include "ReturnConstRefFromParameterCheck.h"
@@ -184,6 +185,8 @@ public:
         "bugprone-incorrect-enable-if");
     CheckFactories.registerCheck<IncorrectEnableSharedFromThisCheck>(
         "bugprone-incorrect-enable-shared-from-this");
+    CheckFactories.registerCheck<RawOwningPointerMemberCheck>(
+        "bugprone-raw-owning-pointer-member");
     CheckFactories.registerCheck<UnintendedCharOstreamOutputCheck>(
         "bugprone-unintended-char-ostream-output");
     CheckFactories.registerCheck<ReturnConstRefFromParameterCheck>(

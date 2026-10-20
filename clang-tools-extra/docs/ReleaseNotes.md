@@ -141,6 +141,12 @@ infrastructure are described first, followed by tool-specific sections.
 
 #### New checks
 
+- New {doc}`bugprone-raw-owning-pointer-member
+  <clang-tidy/checks/bugprone/raw-owning-pointer-member>` check.
+
+  Finds classes that release a raw pointer member in their destructor but copy
+  or move it shallowly.
+
 - New {doc}`llvm-invalid-regex-pattern
   <clang-tidy/checks/llvm/invalid-regex-pattern>` check.
 
